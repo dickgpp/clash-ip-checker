@@ -1,4 +1,7 @@
 aiohttp
 pyyaml
-playwright
 curl_cffi
+fastapi
+uvicorn
+python-multipart
+requests

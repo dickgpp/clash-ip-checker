@@ -5,7 +5,7 @@ __pycache__/
 
 # Clsh Automator Specific
 *.yaml
-!config.yaml.example
+!config.yaml
 *_checked.yaml
 run.log
 
@@ -16,3 +16,5 @@ run.log
 .gemini/
 .agent/
 brain/
+
+*.map
