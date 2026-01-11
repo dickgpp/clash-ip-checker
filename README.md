@@ -16,7 +16,7 @@ Web可视化配置检测：
 ![alt text](assets/clash-web-check.png)
 ## 📅 更新日志 (Changelog)
 
-### v2.0.0 (2025-01-11)
+### v2.0.0 (2026-01-11)
 - **Web UI**: 全新推出 Web 可视化界面，操作更便捷。
 - **多源检测**: 新增 `Ping0` 检测源 支持共享人数，与 `ippure` 互补，并设为默认（速度与信息量平衡更佳）。
 - **智能降级**: 新增 `Fallback` 机制，例如：Ping0 失败时自动切换至 IPPure。
