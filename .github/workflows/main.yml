@@ -1,26 +1,31 @@
 name: 自动清洗节点 (Auto Clean)
 
 on:
-  workflow_dispatch: # 允许手动点击按钮运行
+  workflow_dispatch:
   schedule:
-    - cron: '0 22 * * *' # 每天北京时间早上6点自动运行
+    - cron: '0 22 * * *'
 
 jobs:
   run_cleaner:
     runs-on: ubuntu-latest
-    
+    permissions: 
+      contents: write
+      
     steps:
       - name: 1. 拉取代码
         uses: actions/checkout@v3
         with:
-          ref: docker  # 强制使用 docker 分支
+          ref: docker
 
       - name: 2. 准备配置
         run: |
-          # 下载订阅链接
           curl -L "${{ secrets.SUB_URL }}" -o subs.yaml
+          # 检查订阅是否下载成功
+          if [ ! -s subs.yaml ]; then
+            echo "错误：订阅文件为空或下载失败！请检查 SUB_URL 密钥。"
+            exit 1
+          fi
           
-          # 生成配置文件
           cat <<EOF > config.yaml
           clash_api_url: "http://127.0.0.1:9090"
           sources:
@@ -31,20 +36,30 @@ jobs:
           print_debug: true
           EOF
 
-      - name: 3. 构建环境并运行
+      - name: 3. 运行清洗 (尝试模式)
+        id: clean
         run: |
-          # 构建 Docker 镜像
           docker build -t ip-checker .
-          
-          # 运行清洗
-          # 加上 || true 是防止因为没有 Clash 核心报错而中断，尝试只利用 API 检测风险
+          # 运行并尝试生成文件
           docker run --rm -v $(pwd):/app ip-checker python main.py || true
+          
+          # 【关键检查】看看文件到底生成没有
+          if [ -f "cleaned.yaml" ]; then
+            echo "SUCCESS: 成功生成了清洗后的文件！"
+            echo "file_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "WARNING: 没有生成 cleaned.yaml 文件。可能是因为没有 Clash 后台。"
+            echo "file_exists=false" >> $GITHUB_OUTPUT
+            # 创建一个假文件防止下一步报错，仅供测试
+            echo "No nodes cleaned because Clash is missing" > cleaned.yaml
+          fi
 
       - name: 4. 上传结果到 Gist
-        uses: exuanbo/actions-deploy-gist@v1
+        # 这里使用了 v1.1.4 版本，解决了之前的参数报错问题
+        uses: exuanbo/actions-deploy-gist@v1.1.4
         with:
           token: ${{ secrets.GIST_TOKEN }}
           enable_set_cookie: false
           file_path: cleaned.yaml
-          gist_description: "Clash Cleaned Nodes"
+          gist_description: "Clash Cleaned Nodes (By GitHub Actions)"
           gist_file_name: nodes.yaml
