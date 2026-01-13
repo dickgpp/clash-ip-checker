@@ -3,32 +3,31 @@ name: 自动清洗节点 (Auto Clean)
 on:
   workflow_dispatch:
   schedule:
-    # GitHub Actions 的 cron 使用 UTC
-    # UTC 22:00 = 澳门时间 06:00（UTC+8）
-    - cron: "0 22 * * *"
+    - cron: "0 22 * * *"   # UTC 22:00 = 澳门时间 06:00
 
 jobs:
   run_cleaner:
     runs-on: ubuntu-latest
-
-    # 最小权限 / Least privilege
+    timeout-minutes: 35
     permissions:
       contents: read
 
     steps:
-      - name: 1. Checkout docker branch
+      - name: 1) Checkout docker branch
         uses: actions/checkout@v4
         with:
           ref: docker
 
-      - name: 2. Start service (docker compose up)
+      - name: 2) Start service (docker compose up)
         run: |
+          set -e
           docker compose up -d --build
           docker ps
 
-      - name: 3. Wait for API ready
+      - name: 3) Wait for API ready (/ipcheck)
         run: |
-          for i in {1..60}; do
+          set -e
+          for i in {1..90}; do
             if curl -fsS http://127.0.0.1:8000/ipcheck >/dev/null; then
               echo "Service is ready"
               exit 0
@@ -39,31 +38,101 @@ jobs:
           docker compose logs --no-color || true
           exit 1
 
-      - name: 4. Generate cleaned config via /check
+      - name: 4) Generate outputs for multiple subscriptions (poll until tagged)
         env:
-          SUB_URL: ${{ secrets.SUB_URL }}
+          SUB_URLS: ${{ secrets.SUB_URLS }}
         run: |
+          set -e
           python - <<'PY'
-          import os, urllib.parse, subprocess, sys
-          sub = os.environ.get("SUB_URL", "").strip()
-          if not sub:
-            print("ERROR: secrets.SUB_URL is empty. Please set SUB_URL in Settings -> Secrets and variables -> Actions.", file=sys.stderr)
+          import os, re, time, sys, urllib.parse, subprocess, pathlib
+
+          raw = os.environ.get("SUB_URLS", "").strip()
+          if not raw:
+            print("ERROR: secrets.SUB_URLS is empty. Put one subscription URL per line.", file=sys.stderr)
             sys.exit(1)
 
-          url = "http://127.0.0.1:8000/check?url=" + urllib.parse.quote(sub, safe="")
-          subprocess.check_call(["curl", "-fsSL", url, "-o", "cleaned.yaml"])
-          print("Generated cleaned.yaml")
-          PY
-          ls -lh cleaned.yaml
+          # Parse URLs: one per line, ignore empty lines and lines starting with '#'
+          urls = []
+          for line in raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+              continue
+            urls.append(line)
 
-      - name: 5. Upload artifact (Artifacts)
+          if not urls:
+            print("ERROR: No valid URLs found in SUB_URLS.", file=sys.stderr)
+            sys.exit(1)
+
+          out_dir = pathlib.Path("outputs")
+          out_dir.mkdir(exist_ok=True)
+
+          # Keywords to detect "tagged" output
+          keywords = [
+            "机房", "原生", "广播",
+            "风险", "极好", "高危", "极度风险",
+            "ping0", "ippure",
+            "Risk", "HIGH", "MED", "LOW"
+          ]
+
+          def is_tagged(text: str) -> bool:
+            return any(k in text for k in keywords)
+
+          def host_from_url(url: str) -> str:
+            m = re.search(r"https?://([^/]+)", url)
+            host = m.group(1) if m else "sub"
+            return re.sub(r"[^a-zA-Z0-9._-]+", "_", host)
+
+          def fetch_once(api: str, out_file: pathlib.Path):
+            subprocess.check_call(["curl", "-fsSL", api, "-o", str(out_file)])
+
+          # Poll settings (adjust if you have many nodes)
+          per_sub_timeout = 12 * 60   # 12 min each subscription
+          interval = 15              # poll every 15s
+
+          for idx, sub in enumerate(urls, 1):
+            host = host_from_url(sub)
+            out_file = out_dir / f"cleaned_{idx:02d}_{host}.yaml"
+            api = "http://127.0.0.1:8000/check?url=" + urllib.parse.quote(sub, safe="")
+
+            print(f"\n=== [{idx}/{len(urls)}] Start: {host} ===")
+            start = time.time()
+            attempt = 0
+            tagged = False
+
+            while True:
+              attempt += 1
+              fetch_once(api, out_file)
+              content = out_file.read_text(encoding="utf-8", errors="ignore")
+
+              if is_tagged(content):
+                tagged = True
+                print(f"OK: tagged output detected (attempt {attempt}) -> {out_file.name}")
+                break
+
+              if time.time() - start >= per_sub_timeout:
+                print(f"TIMEOUT: not tagged after {per_sub_timeout}s -> keep last output: {out_file.name}", file=sys.stderr)
+                break
+
+              print(f"Not tagged yet (attempt {attempt}), sleep {interval}s...")
+              time.sleep(interval)
+
+            print(f"Saved: {out_file} | Tagged: {tagged}")
+
+          print("\nAll done. Files:")
+          for p in sorted(out_dir.glob("cleaned_*.yaml")):
+            print(" -", p.name)
+          PY
+
+          ls -lh outputs || true
+
+      - name: 5) Upload artifact (Artifacts)
         uses: actions/upload-artifact@v4
         with:
           name: cleaned-yaml
-          path: cleaned.yaml
-          retention-days: 30
+          path: outputs/cleaned_*.yaml
+          retention-days: 14
 
-      - name: 6. Shutdown
+      - name: 6) Shutdown
         if: always()
         run: |
           docker compose down
