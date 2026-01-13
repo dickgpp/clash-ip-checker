@@ -1,0 +1,50 @@
+name: 自动清洗节点 (Auto Clean)
+
+on:
+  workflow_dispatch: # 允许手动点击按钮运行
+  schedule:
+    - cron: '0 22 * * *' # 每天北京时间早上6点自动运行
+
+jobs:
+  run_cleaner:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 1. 拉取代码
+        uses: actions/checkout@v3
+        with:
+          ref: docker  # 强制使用 docker 分支
+
+      - name: 2. 准备配置
+        run: |
+          # 下载订阅链接
+          curl -L "${{ secrets.SUB_URL }}" -o subs.yaml
+          
+          # 生成配置文件
+          cat <<EOF > config.yaml
+          clash_api_url: "http://127.0.0.1:9090"
+          sources:
+            - "./subs.yaml"
+          output_file: "cleaned.yaml"
+          concurrent_requests: 5
+          check_risk: true
+          print_debug: true
+          EOF
+
+      - name: 3. 构建环境并运行
+        run: |
+          # 构建 Docker 镜像
+          docker build -t ip-checker .
+          
+          # 运行清洗
+          # 加上 || true 是防止因为没有 Clash 核心报错而中断，尝试只利用 API 检测风险
+          docker run --rm -v $(pwd):/app ip-checker python main.py || true
+
+      - name: 4. 上传结果到 Gist
+        uses: exuanbo/actions-deploy-gist@v1
+        with:
+          token: ${{ secrets.GIST_TOKEN }}
+          enable_set_cookie: false
+          file_path: cleaned.yaml
+          gist_description: "Clash Cleaned Nodes"
+          gist_file_name: nodes.yaml
