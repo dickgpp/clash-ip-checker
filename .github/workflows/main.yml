@@ -3,13 +3,17 @@ name: 自动清洗节点 (Auto Clean)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 22 * * *"   # UTC 22:00 = 澳门时间 06:00
+    # GitHub Actions 的 cron 使用 UTC
+    # UTC 22:00 = 澳门时间 06:00（UTC+8）
+    - cron: "0 22 * * *"
 
 jobs:
   run_cleaner:
     runs-on: ubuntu-latest
+
+    # 最小权限 / Least privilege
     permissions:
-      contents: write
+      contents: read
 
     steps:
       - name: 1. Checkout docker branch
@@ -40,22 +44,24 @@ jobs:
           SUB_URL: ${{ secrets.SUB_URL }}
         run: |
           python - <<'PY'
-          import os, urllib.parse, subprocess
-          sub = os.environ["SUB_URL"]
+          import os, urllib.parse, subprocess, sys
+          sub = os.environ.get("SUB_URL", "").strip()
+          if not sub:
+            print("ERROR: secrets.SUB_URL is empty. Please set SUB_URL in Settings -> Secrets and variables -> Actions.", file=sys.stderr)
+            sys.exit(1)
+
           url = "http://127.0.0.1:8000/check?url=" + urllib.parse.quote(sub, safe="")
           subprocess.check_call(["curl", "-fsSL", url, "-o", "cleaned.yaml"])
           print("Generated cleaned.yaml")
           PY
           ls -lh cleaned.yaml
 
-      - name: 5. Upload to Gist
-        uses: exuanbo/actions-deploy-gist@v1.1.4
+      - name: 5. Upload artifact (Artifacts)
+        uses: actions/upload-artifact@v4
         with:
-          token: ${{ secrets.GIST_TOKEN }}
-          enable_set_cookie: false
-          file_path: cleaned.yaml
-          gist_description: "Clash Cleaned Nodes (By GitHub Actions)"
-          gist_file_name: nodes.yaml
+          name: cleaned-yaml
+          path: cleaned.yaml
+          retention-days: 30
 
       - name: 6. Shutdown
         if: always()
