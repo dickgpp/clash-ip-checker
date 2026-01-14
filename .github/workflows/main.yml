@@ -3,12 +3,14 @@ name: 自动清洗节点 (Auto Clean)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 22 * * *"   # UTC 22:00 = 澳门时间 06:00
+    # UTC 22:00 = 澳门时间 06:00
+    - cron: "0 22 * * *"
 
 jobs:
   run_cleaner:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 40
+
     permissions:
       contents: read
 
@@ -26,106 +28,135 @@ jobs:
 
       - name: 3) Wait for API ready (/ipcheck)
         run: |
-          set -e
-          for i in {1..90}; do
-            if curl -fsS http://127.0.0.1:8000/ipcheck >/dev/null; then
-              echo "Service is ready"
+          echo "Waiting for service to be ready..."
+          for i in {1..30}; do
+            if curl -sf http://127.0.0.1:8000/health >/dev/null 2>&1; then
+              echo "Service ready."
               exit 0
             fi
             sleep 2
           done
-          echo "Service not ready" >&2
-          docker compose logs --no-color || true
+          echo "Service did not become ready in time"
           exit 1
 
-      - name: 4) Generate outputs for multiple subscriptions (poll until tagged)
+      - name: 4) Generate outputs for multiple subscriptions (tolerate 429)
         env:
           SUB_URLS: ${{ secrets.SUB_URLS }}
         run: |
-          set -e
           python - <<'PY'
           import os, re, time, sys, urllib.parse, subprocess, pathlib
 
           raw = os.environ.get("SUB_URLS", "").strip()
           if not raw:
-            print("ERROR: secrets.SUB_URLS is empty. Put one subscription URL per line.", file=sys.stderr)
-            sys.exit(1)
+              print("ERROR: secrets.SUB_URLS is empty. Put one subscription URL per line.", file=sys.stderr)
+              sys.exit(1)
 
-          # Parse URLs: one per line, ignore empty lines and lines starting with '#'
           urls = []
           for line in raw.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-              continue
-            urls.append(line)
-
-          if not urls:
-            print("ERROR: No valid URLs found in SUB_URLS.", file=sys.stderr)
-            sys.exit(1)
+              line = line.strip()
+              if not line or line.startswith("#"):
+                  continue
+              urls.append(line)
 
           out_dir = pathlib.Path("outputs")
           out_dir.mkdir(exist_ok=True)
 
-          # Keywords to detect "tagged" output
           keywords = [
-            "机房", "原生", "广播",
-            "风险", "极好", "高危", "极度风险",
-            "ping0", "ippure",
-            "Risk", "HIGH", "MED", "LOW"
+              "机房", "原生", "广播",
+              "风险", "极好", "高危", "极度风险",
+              "ping0", "ippure",
+              "Risk", "HIGH", "MED", "LOW"
           ]
 
           def is_tagged(text: str) -> bool:
-            return any(k in text for k in keywords)
+              return any(k in text for k in keywords)
 
           def host_from_url(url: str) -> str:
-            m = re.search(r"https?://([^/]+)", url)
-            host = m.group(1) if m else "sub"
-            return re.sub(r"[^a-zA-Z0-9._-]+", "_", host)
+              m = re.search(r"https?://([^/]+)", url)
+              host = m.group(1) if m else "sub"
+              return re.sub(r"[^a-zA-Z0-9._-]+", "_", host)
 
-          def fetch_once(api: str, out_file: pathlib.Path):
-            subprocess.check_call(["curl", "-fsSL", api, "-o", str(out_file)])
+          def curl_fetch(api: str, out_file: pathlib.Path) -> int:
+              p = subprocess.run(
+                  ["curl", "-sS", "-L", "-w", "%{http_code}", api, "-o", str(out_file)],
+                  capture_output=True,
+                  text=True
+              )
+              s = (p.stdout or "").strip()
+              try:
+                  return int(s[-3:])
+              except:
+                  return 0
 
-          # Poll settings (adjust if you have many nodes)
-          per_sub_timeout = 12 * 60   # 12 min each subscription
-          interval = 15              # poll every 15s
+          PER_SUB_TIMEOUT = 12 * 60
+          INTERVAL = 20
+          MAX_RETRY_429 = 6
+
+          failed = []
 
           for idx, sub in enumerate(urls, 1):
-            host = host_from_url(sub)
-            out_file = out_dir / f"cleaned_{idx:02d}_{host}.yaml"
-            api = "http://127.0.0.1:8000/check?url=" + urllib.parse.quote(sub, safe="")
+              host = host_from_url(sub)
+              out_file = out_dir / f"cleaned_{idx:02d}_{host}.yaml"
+              api = "http://127.0.0.1:8000/check?url=" + urllib.parse.quote(sub, safe="")
 
-            print(f"\n=== [{idx}/{len(urls)}] Start: {host} ===")
-            start = time.time()
-            attempt = 0
-            tagged = False
+              print(f"\n=== [{idx}/{len(urls)}] Start: {host} ===")
+              start = time.time()
+              attempt = 0
+              retry_429 = 0
+              tagged = False
 
-            while True:
-              attempt += 1
-              fetch_once(api, out_file)
-              content = out_file.read_text(encoding="utf-8", errors="ignore")
+              while True:
+                  attempt += 1
+                  code = curl_fetch(api, out_file)
 
-              if is_tagged(content):
-                tagged = True
-                print(f"OK: tagged output detected (attempt {attempt}) -> {out_file.name}")
-                break
+                  if code == 429:
+                      retry_429 += 1
+                      wait = min(120, 20 * retry_429)
+                      print(f"HTTP 429 (rate limited). retry {retry_429}/{MAX_RETRY_429}, wait {wait}s...")
+                      if retry_429 >= MAX_RETRY_429:
+                          print(f"SKIP: too many 429 for {host}")
+                          break
+                      time.sleep(wait)
+                      continue
 
-              if time.time() - start >= per_sub_timeout:
-                print(f"TIMEOUT: not tagged after {per_sub_timeout}s -> keep last output: {out_file.name}", file=sys.stderr)
-                break
+                  if code != 200:
+                      print(f"HTTP {code} (not 200). sleep {INTERVAL}s and retry...")
+                      if time.time() - start >= PER_SUB_TIMEOUT:
+                          print("TIMEOUT while retrying non-200, keep last output.")
+                          break
+                      time.sleep(INTERVAL)
+                      continue
 
-              print(f"Not tagged yet (attempt {attempt}), sleep {interval}s...")
-              time.sleep(interval)
+                  content = out_file.read_text(encoding="utf-8", errors="ignore")
+                  if is_tagged(content):
+                      tagged = True
+                      print(f"OK: tagged output detected (attempt {attempt}) -> {out_file.name}")
+                      break
 
-            print(f"Saved: {out_file} | Tagged: {tagged}")
+                  if time.time() - start >= PER_SUB_TIMEOUT:
+                      print("TIMEOUT: not tagged in time, keep last output.")
+                      break
 
-          print("\nAll done. Files:")
-          for p in sorted(out_dir.glob("cleaned_*.yaml")):
-            print(" -", p.name)
+                  print(f"Not tagged yet (attempt {attempt}), sleep {INTERVAL}s...")
+                  time.sleep(INTERVAL)
+
+              print(f"Saved: {out_file} | Tagged: {tagged}")
+
+              if not out_file.exists() or out_file.stat().st_size == 0:
+                  failed.append(host)
+
+          if failed:
+              print("\nFAILED / SKIPPED subscriptions:", ", ".join(failed), file=sys.stderr)
+          else:
+              print("\nAll subscriptions processed.")
+
           PY
 
+          echo "Generated files:"
           ls -lh outputs || true
 
       - name: 5) Upload artifact (Artifacts)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: cleaned-yaml
@@ -135,4 +166,4 @@ jobs:
       - name: 6) Shutdown
         if: always()
         run: |
-          docker compose down
+          docker compose down -v
